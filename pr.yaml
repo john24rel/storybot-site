@@ -1,0 +1,148 @@
+name: Check source changes in new_qa.tfvars
+
+on:
+  pull_request:
+    branches:
+      - master
+    paths:
+      - new_qa.tfvars  # Trigger only if this file changes
+  workflow_dispatch:  # Allow manual triggering of the action for testing
+
+jobs:
+  check-source-changes:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0  # Fetch all history to compare
+
+    - name: Set up SSH for git clone
+      run: |
+        mkdir -p ~/.ssh  # Ensure .ssh directory exists
+        echo "$PRIVATE_KEY" > ~/.ssh/id_rsa
+        echo "$PUB_KEY" > ~/.ssh/id_rsa.pub
+        chmod 600 ~/.ssh/id_rsa
+        chmod 644 ~/.ssh/id_rsa.pub
+        eval $(ssh-agent -s)
+        ssh-add ~/.ssh/id_rsa
+        ssh-keyscan github.com >> ~/.ssh/known_hosts  # Add GitHub to known hosts
+
+      env:
+        PUB_KEY: |
+          ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDKqZL8FiBl5WR/nVx2tvyoLLEtCZAMw5UG51TZCPMZ0q34gVkSt1jzjdpW1ghMhNPgTElVJ07y9OF1LKg3T36DT9NAUCIe0CLNZrVgi3840txIdBPhywo1OoZ7xHKFfV+QlZ361p5sjCCf5RX/0MkP6usDtd3ZySujw1qmzW0gKmDx+/EQqkX79iqf92V1dJKrN9e+IiJf3gps9uMYmAx3qrpumibJ3zbhsx7vTbmkI1UIKbb5xaNm8mkjWQmsTDxG0kerVxY3Z85Tg9k7hxOWWeISiJFO7zcw1+Q1q5dL9nbMw+gbAhaGZgx2Oi6o/wxZjARI4YDb8LbrqWvpY+BR/qx7yPhjForKCPqD4C78K5pzlrHwuhhzyJ9aq1Kz5UQen7TImyBWH06FmvVcnsTgbRw4n4YMZoZBmfPGcdFovqlr5LG2uDTQVeIObS/2mgJ+HTkiV3//mQRSlkGX40byYppw9PNvgpgvGfL5wnJE8cSZc/Fy5EvFtMb6IDFf4z0= root@3bcfa49ff599
+          
+    - name: Get the diff for new_qa.tfvars
+      id: diff-check
+      run: |
+        git diff origin/master -- new_qa.tfvars > diff.md
+        cat diff.md
+        grep '^[-+]\s*source\s*=' diff.md > source_changes.txt || true
+
+    - name: Check if there are source changes
+      id: source-changes
+      run: |
+        if [ -s source_changes.txt ]; then
+          echo "Source changes detected"
+          echo "::set-output name=changes-detected::true"
+        else
+          echo "No source changes detected"
+          echo "::set-output name=changes-detected::false"
+        fi
+        
+    - name: Compare new and old sources one by one
+      if: steps.source-changes.outputs.changes-detected == 'true'
+      run: |
+        old_sources=$(grep '^-' source_changes.txt | sed 's/^- //')
+        new_sources=$(grep '^+' source_changes.txt | sed 's/^+ //')
+        while IFS= read -r OLD_SOURCE && IFS= read -r NEW_SOURCE <&3; do
+          OLD_REPO=$(echo "$OLD_SOURCE" | grep -oP 'git@github.com:[^"]+' | sed 's/\?ref.*//')
+          NEW_REPO=$(echo "$NEW_SOURCE" | grep -oP 'git@github.com:[^"]+' | sed 's/\?ref.*//')
+          OLD_REF=$(echo "$OLD_SOURCE" | grep -oP 'ref=\K[^"]+' || echo "none")
+          NEW_REF=$(echo "$NEW_SOURCE" | grep -oP 'ref=\K[^"]+' || echo "none")
+          
+          if [ "$OLD_REPO" = "$NEW_REPO" ]; then
+            echo "Comparing refs for $OLD_REPO"
+            if [ "$OLD_REF" != "none" ] && [ "$NEW_REF" != "none" ]; then
+              git clone $OLD_REPO repo
+              cd repo
+              git fetch origin $OLD_REF
+              git fetch origin $NEW_REF
+              git diff $OLD_REF $NEW_REF > ../changelog_$OLD_REF_to_$NEW_REF.md
+              cd ..
+            else
+              echo "Skipping comparison, one of the refs is missing for $OLD_REPO"
+            fi
+          else
+            echo "Repository URLs have changed, cannot compare refs"
+          fi
+        done <<< "$old_sources" 3<<< "$new_sources"
+
+
+    - name: Gather comparison results
+      if: steps.source-changes.outputs.changes-detected == 'true'
+      run: |
+        files=$(ls changelog_*.md)
+        comments=""
+        for file in $files; do
+          diff_content=$(cat "$file" | sed 's/`/\\`/g')
+          comments+="$diff_content"
+        done
+        comments=$(echo "$comments" | sed '/^$/d')
+        echo "$comments" > combined_comments.md
+
+    - name: Overwrite PR comment with diff
+      if: steps.source-changes.outputs.changes-detected == 'true'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const commentBody = fs.readFileSync('combined_comments.md', 'utf8');
+          const { data: comments } = await github.rest.issues.listComments({
+            issue_number: context.payload.pull_request.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+          });
+          const botComment = comments.find(comment => comment.user.login === 'github-actions[bot]');
+          if (botComment) {
+            await github.rest.issues.updateComment({
+              comment_id: botComment.id,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '```diff\n' + commentBody.trim() + '\n```'
+            });
+          } else {
+            await github.rest.issues.createComment({
+              issue_number: context.payload.pull_request.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '```diff\n' + commentBody.trim() + '\n```'
+            });
+          }
+
+    - name: No changes notification
+      if: steps.source-changes.outputs.changes-detected == 'false'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const { data: comments } = await github.rest.issues.listComments({
+            issue_number: context.payload.pull_request.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+          });
+          const botComment = comments.find(comment => comment.user.login === 'github-actions[bot]');
+          if (botComment) {
+            await github.rest.issues.updateComment({
+              comment_id: botComment.id,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: 'No updates to the source field were detected in the PR.'
+            });
+          } else {
+            await github.rest.issues.createComment({
+              issue_number: context.payload.pull_request.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: 'No updates to the source field were detected in the PR.'
+            });
+          }
